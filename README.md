@@ -23,6 +23,12 @@ A collection of desktop applications that combine PySide6 and Folium to create i
 
 ## Key Features
 
+### Weather Integration (In Progress)
+- NOAA weather.gov integration for daily and hourly forecast data
+- Coordinate lookup via weather.gov points endpoint
+- Optional city/ZIP lookup via OpenStreetMap Nominatim
+- Disk-backed SQLite cache with stale fallback support
+
 ### Basic Features
 - **Interactive Map Display**: Uses folium to generate leaflet maps displayed in a PySide6 QWebEngineView
 - **Multiple Map Styles**: Choose from various tile layers including OpenStreetMap, CartoDB, and Stamen maps
@@ -81,6 +87,17 @@ Choose from the available applications in the launcher dialog.
 **Basic Application:**
 ```bash
 python map_app.py
+```
+
+**Simple Leaflet App with Weather Prototype:**
+```bash
+python simple_map_app.py
+```
+
+Optional: set a descriptive NOAA-compatible user agent before running weather features:
+```bash
+# Windows PowerShell
+$env:PYCTS_WEATHER_USER_AGENT = "PyCTS/1.0 (you@example.com)"
 ```
 
 **Enhanced Application:**
