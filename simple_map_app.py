@@ -3,11 +3,13 @@ import os
 import tempfile
 from PySide6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, 
                               QHBoxLayout, QWidget, QPushButton, QLineEdit, 
-                              QLabel, QComboBox, QSpinBox, QGroupBox)
+                              QLabel, QComboBox, QSpinBox, QGroupBox,
+                              QCheckBox, QSlider)
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEngineSettings
-from PySide6.QtCore import QUrl, QTimer, QObject, QThread, Signal, Slot
+from PySide6.QtCore import QUrl, QTimer, QObject, QThread, Signal, Slot, Qt
 
+from weather.radar import RadarTimeIndexService
 from weather.service import WeatherService
 
 
@@ -45,6 +47,28 @@ class WeatherFetchWorker(QObject):
             self.finished.emit()
 
 
+class RadarTimelineWorker(QObject):
+    timeline_ready = Signal(object)
+    timeline_failed = Signal(str)
+    finished = Signal()
+
+    def __init__(self, user_agent, limit=60):
+        super().__init__()
+        self.user_agent = user_agent
+        self.limit = limit
+
+    @Slot()
+    def run(self):
+        try:
+            service = RadarTimeIndexService(self.user_agent)
+            frames = service.get_recent_frames(limit=self.limit)
+            self.timeline_ready.emit([f.__dict__ for f in frames])
+        except Exception as exc:
+            self.timeline_failed.emit(str(exc))
+        finally:
+            self.finished.emit()
+
+
 class SimpleMapApplication(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -58,8 +82,19 @@ class SimpleMapApplication(QMainWindow):
         self.weather_status = "Weather unavailable"
         self.weather_thread = None
         self.weather_worker = None
+        self.radar_service = RadarTimeIndexService(self.weather_service.user_agent)
+        self.radar_enabled = False
+        self.radar_live_mode = True
+        self.radar_frames = []
+        self.radar_selected_time_ms = None
+        self.radar_thread = None
+        self.radar_worker = None
+        self.radar_refresh_timer = QTimer(self)
+        self.radar_refresh_timer.setInterval(60000)
+        self.radar_refresh_timer.timeout.connect(self._refresh_radar_timeline)
         
         self.setup_ui()
+        self.web_view.loadFinished.connect(self._on_map_load_finished)
         self.create_default_map()
     
     def setup_ui(self):
@@ -116,6 +151,35 @@ class SimpleMapApplication(QMainWindow):
 
         self.weather_status_label = QLabel("Weather: not loaded")
         controls_layout.addWidget(self.weather_status_label)
+
+        radar_group = QGroupBox("Radar")
+        radar_layout = QVBoxLayout(radar_group)
+
+        radar_toggle_layout = QHBoxLayout()
+        self.radar_enable_check = QCheckBox("Enable Radar Overlay")
+        self.radar_enable_check.toggled.connect(self._on_radar_enabled_toggled)
+        radar_toggle_layout.addWidget(self.radar_enable_check)
+
+        self.radar_live_check = QCheckBox("Latest")
+        self.radar_live_check.setChecked(True)
+        self.radar_live_check.setEnabled(False)
+        self.radar_live_check.toggled.connect(self._on_radar_live_toggled)
+        radar_toggle_layout.addWidget(self.radar_live_check)
+        radar_layout.addLayout(radar_toggle_layout)
+
+        self.radar_time_slider = QSlider(Qt.Orientation.Horizontal)
+        self.radar_time_slider.setRange(0, 0)
+        self.radar_time_slider.setEnabled(False)
+        self.radar_time_slider.valueChanged.connect(self._on_radar_slider_changed)
+        radar_layout.addWidget(self.radar_time_slider)
+
+        self.radar_time_label = QLabel("Radar time: latest")
+        radar_layout.addWidget(self.radar_time_label)
+
+        self.radar_status_label = QLabel("Radar: disabled")
+        radar_layout.addWidget(self.radar_status_label)
+
+        controls_layout.addWidget(radar_group)
         
         main_layout.addWidget(controls_group)
         
@@ -210,6 +274,158 @@ class SimpleMapApplication(QMainWindow):
         if self.weather_thread:
             self.weather_thread.deleteLater()
             self.weather_thread = None
+
+    def _start_radar_timeline_fetch(self, force=False):
+        """Fetch recent radar frame timestamps without blocking UI."""
+        if self.radar_thread and self.radar_thread.isRunning():
+            return
+        if self.radar_frames and not force:
+            return
+
+        self.radar_status_label.setText("Radar: loading timeline...")
+        self.radar_thread = QThread(self)
+        self.radar_worker = RadarTimelineWorker(self.weather_service.user_agent, limit=60)
+        self.radar_worker.moveToThread(self.radar_thread)
+
+        self.radar_thread.started.connect(self.radar_worker.run)
+        self.radar_worker.timeline_ready.connect(self._on_radar_timeline_ready)
+        self.radar_worker.timeline_failed.connect(self._on_radar_timeline_failed)
+        self.radar_worker.finished.connect(self._cleanup_radar_thread)
+        self.radar_worker.finished.connect(self.radar_thread.quit)
+
+        self.radar_thread.start()
+
+    @Slot(object)
+    def _on_radar_timeline_ready(self, frames_payload):
+        """Store timeline and update slider state."""
+        self.radar_frames = frames_payload or []
+        if not self.radar_frames:
+            self.radar_time_slider.setEnabled(False)
+            self.radar_live_check.setEnabled(False)
+            self.radar_status_label.setText("Radar: no frames available")
+            return
+
+        self.radar_time_slider.blockSignals(True)
+        self.radar_time_slider.setRange(0, len(self.radar_frames) - 1)
+        self.radar_time_slider.setEnabled(not self.radar_live_mode)
+        self.radar_live_check.setEnabled(True)
+
+        if self.radar_live_mode or self.radar_selected_time_ms is None:
+            self.radar_time_slider.setValue(0)
+            self.radar_selected_time_ms = int(self.radar_frames[0]["valid_time_ms"])
+        else:
+            selected_index = 0
+            for i, frame in enumerate(self.radar_frames):
+                if int(frame["valid_time_ms"]) == int(self.radar_selected_time_ms):
+                    selected_index = i
+                    break
+            self.radar_time_slider.setValue(selected_index)
+        self.radar_time_slider.blockSignals(False)
+
+        self._update_radar_time_label()
+        self.radar_status_label.setText("Radar: timeline ready")
+        self._apply_radar_state_to_map()
+
+    @Slot(str)
+    def _on_radar_timeline_failed(self, error_text):
+        """Handle timeline loading failures gracefully."""
+        self.radar_status_label.setText("Radar: timeline unavailable")
+        print(f"Radar timeline fetch failed: {error_text}")
+
+    @Slot()
+    def _cleanup_radar_thread(self):
+        """Tear down radar worker thread objects."""
+        if self.radar_worker:
+            self.radar_worker.deleteLater()
+            self.radar_worker = None
+        if self.radar_thread:
+            self.radar_thread.deleteLater()
+            self.radar_thread = None
+
+    @Slot(bool)
+    def _on_radar_enabled_toggled(self, enabled):
+        """Enable/disable radar overlay and timeline controls."""
+        self.radar_enabled = bool(enabled)
+        if self.radar_enabled:
+            self.radar_status_label.setText("Radar: enabled")
+            self._start_radar_timeline_fetch(force=not self.radar_frames)
+            self.radar_time_slider.setEnabled(bool(self.radar_frames) and not self.radar_live_mode)
+            self.radar_live_check.setEnabled(bool(self.radar_frames))
+            if not self.radar_refresh_timer.isActive():
+                self.radar_refresh_timer.start()
+        else:
+            self.radar_refresh_timer.stop()
+            self.radar_time_slider.setEnabled(False)
+            self.radar_live_check.setEnabled(False)
+            self.radar_status_label.setText("Radar: disabled")
+        self._apply_radar_state_to_map()
+
+    @Slot(bool)
+    def _on_radar_live_toggled(self, enabled):
+        """Switch between latest and manual slider mode."""
+        self.radar_live_mode = bool(enabled)
+        self.radar_time_slider.setEnabled(self.radar_enabled and (not self.radar_live_mode) and bool(self.radar_frames))
+        if self.radar_live_mode and self.radar_frames:
+            self.radar_time_slider.blockSignals(True)
+            self.radar_time_slider.setValue(0)
+            self.radar_time_slider.blockSignals(False)
+            self.radar_selected_time_ms = int(self.radar_frames[0]["valid_time_ms"])
+        self._update_radar_time_label()
+        self._apply_radar_state_to_map()
+
+    @Slot(int)
+    def _on_radar_slider_changed(self, index):
+        """Update selected radar time frame from slider."""
+        if not self.radar_frames or index < 0 or index >= len(self.radar_frames):
+            return
+        self.radar_selected_time_ms = int(self.radar_frames[index]["valid_time_ms"])
+        if not self.radar_live_mode:
+            self._update_radar_time_label()
+            self._apply_radar_state_to_map()
+
+    def _refresh_radar_timeline(self):
+        """Periodic timeline refresh in live mode."""
+        if not self.radar_enabled:
+            return
+        self._start_radar_timeline_fetch(force=True)
+
+    def _update_radar_time_label(self):
+        """Refresh user-facing radar time text."""
+        if not self.radar_frames:
+            self.radar_time_label.setText("Radar time: latest")
+            return
+
+        if self.radar_live_mode:
+            frame = self.radar_frames[0]
+            self.radar_time_label.setText(f"Radar time: {frame['label_utc']} (live)")
+            return
+
+        for frame in self.radar_frames:
+            if int(frame["valid_time_ms"]) == int(self.radar_selected_time_ms or 0):
+                self.radar_time_label.setText(f"Radar time: {frame['label_utc']}")
+                return
+        self.radar_time_label.setText("Radar time: custom")
+
+    @Slot(bool)
+    def _on_map_load_finished(self, _ok):
+        """Reapply radar state after each HTML map load."""
+        self._apply_radar_state_to_map()
+
+    def _apply_radar_state_to_map(self):
+        """Push radar enabled/time state into the in-page Leaflet controller."""
+        page = self.web_view.page()
+        enabled_js = "true" if self.radar_enabled else "false"
+        page.runJavaScript(f"window.setRadarEnabled && window.setRadarEnabled({enabled_js});")
+
+        if not self.radar_enabled:
+            return
+
+        selected_time = self.radar_selected_time_ms
+        if self.radar_live_mode and self.radar_frames:
+            selected_time = int(self.radar_frames[0]["valid_time_ms"])
+
+        if selected_time is not None:
+            page.runJavaScript(f"window.setRadarTime && window.setRadarTime({int(selected_time)});")
     
     def create_map_html(self, lat, lon, zoom):
         """Create HTML with embedded Leaflet map"""
@@ -227,6 +443,11 @@ class SimpleMapApplication(QMainWindow):
             var weatherMarker = L.marker([{lat}, {lon}]).addTo(map);
             weatherMarker.bindPopup("{weather_popup}");
         """
+
+        initial_radar_enabled = "true" if self.radar_enabled else "false"
+        initial_radar_time = "null"
+        if self.radar_selected_time_ms is not None:
+            initial_radar_time = str(int(self.radar_selected_time_ms))
         
         html_content = f"""
 <!DOCTYPE html>
@@ -245,12 +466,79 @@ class SimpleMapApplication(QMainWindow):
     <div id="map"></div>
     <script>
         var map = L.map('map').setView([{lat}, {lon}], {zoom});
+
+        var radarImageServerBase = "https://mapservices.weather.noaa.gov/eventdriven/rest/services/radar/radar_base_reflectivity_time/ImageServer";
+        var radarEnabled = {initial_radar_enabled};
+        var radarTimeMs = {initial_radar_time};
+        var radarOverlay = null;
         
         L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
             attribution: '© OpenStreetMap contributors'
         }}).addTo(map);
+
+        function buildRadarExportUrl(timeMs) {{
+            var bounds = map.getBounds();
+            var sw = map.options.crs.project(bounds.getSouthWest());
+            var ne = map.options.crs.project(bounds.getNorthEast());
+            var bbox = [sw.x, sw.y, ne.x, ne.y].join(',');
+            var size = map.getSize().x + ',' + map.getSize().y;
+
+            var url = radarImageServerBase
+                + '/exportImage?f=image'
+                + '&bbox=' + encodeURIComponent(bbox)
+                + '&bboxSR=3857'
+                + '&imageSR=3857'
+                + '&size=' + encodeURIComponent(size)
+                + '&format=png32'
+                + '&transparent=true';
+
+            if (timeMs !== null && timeMs !== undefined) {{
+                url += '&time=' + encodeURIComponent(String(timeMs));
+            }}
+            return url;
+        }}
+
+        function clearRadarOverlay() {{
+            if (radarOverlay) {{
+                map.removeLayer(radarOverlay);
+                radarOverlay = null;
+            }}
+        }}
+
+        function updateRadarOverlayFromMapState() {{
+            if (!radarEnabled) {{
+                clearRadarOverlay();
+                return;
+            }}
+
+            var imageBounds = map.getBounds();
+            var imageUrl = buildRadarExportUrl(radarTimeMs);
+            clearRadarOverlay();
+            radarOverlay = L.imageOverlay(imageUrl, imageBounds, {{ opacity: 0.6 }});
+            radarOverlay.addTo(map);
+        }}
+
+        window.setRadarEnabled = function(enabled) {{
+            radarEnabled = !!enabled;
+            updateRadarOverlayFromMapState();
+        }};
+
+        window.setRadarTime = function(timeMs) {{
+            radarTimeMs = timeMs;
+            updateRadarOverlayFromMapState();
+        }};
+
+        window.updateRadarOverlayFromMapState = updateRadarOverlayFromMapState;
+
+        map.on('moveend zoomend resize', function() {{
+            if (radarEnabled) {{
+                updateRadarOverlayFromMapState();
+            }}
+        }});
         
         {markers_html}
+
+        updateRadarOverlayFromMapState();
         
         console.log('Map loaded successfully');
     </script>
@@ -328,6 +616,11 @@ class SimpleMapApplication(QMainWindow):
     
     def closeEvent(self, event):
         """Clean up on close"""
+        self.radar_refresh_timer.stop()
+        if self.radar_thread and self.radar_thread.isRunning():
+            self.radar_thread.quit()
+            self.radar_thread.wait(2000)
+
         if self.weather_thread and self.weather_thread.isRunning():
             self.weather_thread.quit()
             self.weather_thread.wait(2000)
